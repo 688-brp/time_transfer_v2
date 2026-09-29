@@ -12,7 +12,7 @@ log = logging.getLogger(__name__)
 
 # ONLY explicit force/sweep flags trigger a global queue sweep.
 # Routine flags (--rinex-hourly, --rinex-daily, --range) remain strictly targeted.
-SWEEP_FLAGS = {'--sweep', '--force', '--manual', '-f'}
+SWEEP_FLAGS = {'--sweep', '--force', '-f'}
 
 
 def execute_rsync_fetch(job: dict, tracker, timeout: int = 180) -> bool:
@@ -87,9 +87,9 @@ def drain_fetch_queue(tracker, job_type: str = None, target_pattern: str = None,
 
     if is_sweep:
         log.info("[FETCHER] Global sweep flag detected. Draining ALL pending queue items.")
-        pending = tracker.get_pending_fetches(sweep_all=True)
+        pending = tracker.get_pending_inbound()
     else:
-        pending = tracker.get_pending_fetches(job_type=job_type, target_pattern=target_pattern)
+        pending = tracker.get_pending_inbound(job_type=job_type, target_pattern=target_pattern)
 
     if not pending:
         label_parts = []
