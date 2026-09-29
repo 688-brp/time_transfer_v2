@@ -168,7 +168,7 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
         log.info("  [ENGINE] Queueing remote fetch tasks...")
         
         if is_cggtts_rapid and not is_historical_day:
-            tracker.reset_fetch_status(target_str=target_str, job_type="DAILY_BIN")
+            tracker.reset_status(target_pattern=target_str, destination_tag="DAILY_BIN")
 
         for node in nodes.values():
             if is_hourly_rinex:
