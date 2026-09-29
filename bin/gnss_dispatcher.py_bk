@@ -1,0 +1,117 @@
+#!/home/denali/miniforge3/bin/python3
+"""
+gnss_dispatcher.py - CLI entry point, argument router, and process locker.
+Category: MUTABLE CONNECTOR (< 100 lines)
+"""
+
+import os
+import sys
+import fcntl
+import logging
+import argparse
+from pathlib import Path
+from datetime import datetime, timezone
+
+# Enforce project root in sys.path BEFORE importing local packages
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+# Now import project modules cleanly
+import config.pipeline_targets as pipeline_config
+import config.gnss_config as gnss_config
+from config.gnss_config import LOG_DIR
+from lib.tracker import PipelineTracker
+from lib.engine import run_pipeline, _parse_time_str
+from lib.config_inspector import ConfigInspector
+
+# Logging setup
+log_file = LOG_DIR / f"gnss_dispatcher_{datetime.now(timezone.utc).strftime('%Y%m%d')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[logging.FileHandler(log_file), logging.StreamHandler(sys.stdout)]
+)
+log = logging.getLogger("Dispatcher")
+
+# Lock file environment isolation
+env_suffix = f"_{os.environ.get('GNSS_ENV')}" if os.environ.get("GNSS_ENV") else ""
+LOCK_FILE = f"/tmp/gnss_dispatcher{env_suffix}.lock"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="GNSS Automation & Data Dispatcher")
+
+    cron_grp = parser.add_argument_group("Automated Tasks (Cron Steady-State)")
+    cron_grp.add_argument("--cggtts", action="store_true", 
+                          help="Rapid Intraday CGGTTS (No boundary stitching)")
+    cron_grp.add_argument("--cggtts-daily", action="store_true", 
+                          help="Daily/Top-of-Hour CGGTTS (Includes Day N+1 boundary stitching)")
+    cron_grp.add_argument("--rinex-hourly", action="store_true")
+    cron_grp.add_argument("--rinex-daily", action="store_true")
+
+
+    man_grp = parser.add_argument_group("Manual Routing & Backfills (Overrides DB)")
+    man_grp.add_argument("--range", nargs='+', type=str, metavar='RANGE',
+                         help="Manual override: START STOP (or just START for single target). Clears ledger locks.")
+    
+    man_grp.add_argument("--no-fetch", action="store_true")
+    man_grp.add_argument("--local-only", action="store_true")
+    man_grp.add_argument("--skip-cddis", action="store_true")
+    man_grp.add_argument("--skip-rnx2", action="store_true", help="Bypass legacy RINEX 2 generation to speed up execution.")
+
+    admin_grp = parser.add_argument_group("Administrative Operations")
+    admin_grp.add_argument("--status", action="store_true", 
+                           help="Print SQLite queue summary and exit.")
+    admin_grp.add_argument("--reset-retries", action="store_true", 
+                           help="Reset all FAILED attempts to 0.")
+
+    args = parser.parse_args()
+
+    # =========================================================================
+    # PRE-FLIGHT & CONFIGURATION
+    # =========================================================================
+    inspector = ConfigInspector()
+    inspector.validate_cli_args(args, sys.argv)
+
+    # Instantiate Tracker using from_args to route live vs shadow database correctly
+    tracker = PipelineTracker.from_args(args)
+
+    # =========================================================================
+    # ADMINISTRATIVE OPERATIONS (Immediate Exit)
+    # =========================================================================
+    if args.status:
+        print("\n=== GNSS PIPELINE QUEUE STATUS ===")
+        for stat, count in tracker.get_status_summary():
+            print(f"  {stat}: {count}")
+        sys.exit(0)
+
+    # Adapted reset-retries to use the universal --range flag
+    if args.reset_retries:
+        if not args.range:
+            parser.error("Admin Fault: --reset-retries requires a target window via --range.")
+        target_dt = _parse_time_str(args.range[0])
+        pattern = target_dt.strftime("%Y%j")
+        count = tracker.reset_failed_jobs(pattern)
+        print(f"[ADMIN] Reset {count} FAILED jobs for pattern {pattern}")
+        sys.exit(0)
+
+    # =========================================================================
+    # OS FILE LOCKING & PIPELINE EXECUTION
+    # =========================================================================
+    lock_fd = open(LOCK_FILE, 'w')
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (IOError, BlockingIOError):
+        log.warning("Dispatcher already running. Aborting overlapping instance.")
+        sys.exit(0)
+
+    try:
+        run_pipeline(args, tracker, log, pipeline_config)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        lock_fd.close()
+
+
+if __name__ == "__main__":
+    main()

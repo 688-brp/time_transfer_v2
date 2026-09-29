@@ -1,0 +1,15 @@
+cat << 'EOF' > .gitignore
+# 1. Ignore heavy data and temporary working directories
+data_base/
+local_archive/
+local_scratch/
+sandbox_env/
+logs/
+
+# 2. Ignore Python cache and SQLite databases (wherever they appear)
+__pycache__/
+*.py[cod]
+*.sqlite
+*.db
+*.log
+EOF

@@ -1,0 +1,381 @@
+"""
+tracker.py - Unified SQLite State Engine for GNSS Pipeline.
+Category: IMMUTABLE CORE (Append-only)
+
+Handles idempotency, state transitions, retry counters, and manual/cron
+database isolation (pipeline_queue.db vs pipeline_shadow.db).
+"""
+
+import sqlite3
+import logging
+import fnmatch
+from pathlib import Path
+from datetime import datetime, timezone, timedelta
+from config.gnss_config import LIVE_DB_PATH, SHADOW_DB_PATH
+
+log = logging.getLogger(__name__)
+
+
+class PipelineTracker:
+    def __init__(self, db_path: Path = LIVE_DB_PATH):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    @classmethod
+    def from_args(cls, args):
+        """Routes database targeting based on execution flags without unlinking existing state."""
+        is_manual_backfill = bool(getattr(args, 'date', None) or getattr(args, 'range', None))
+        
+        if is_manual_backfill:
+            log.info("[TRACKER] Manual run detected. Utilizing isolated SHADOW database.")
+            return cls(db_path=SHADOW_DB_PATH)
+            
+        return cls(db_path=LIVE_DB_PATH)
+
+    def _get_connection(self):
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        """Creates full schema ensuring SQLite WAL mode."""
+        with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            
+            # 1. Outbound Queue (Uploads & Network Routing)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS outbound_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    file_path TEXT NOT NULL,
+                    destination TEXT NOT NULL,
+                    status TEXT CHECK(status IN ('PENDING', 'SUCCESS', 'FAILED')) DEFAULT 'PENDING',
+                    retry_count INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(file_path, destination)
+                );
+            """)
+            
+            # 2. Inbound Queue (Downloads & Rsync Fetching)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS inbound_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    station TEXT NOT NULL,
+                    job_type TEXT NOT NULL,
+                    target_str TEXT NOT NULL,
+                    remote_src TEXT NOT NULL,
+                    local_dest TEXT NOT NULL,
+                    status TEXT CHECK(status IN ('PENDING', 'FETCHED', 'FAILED')) DEFAULT 'PENDING',
+                    retry_count INTEGER DEFAULT 0,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(remote_src, target_str)
+                );
+            """)
+            
+            # 3. Hardware Quarantine Log
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS quarantine_log (
+                    station TEXT NOT NULL,
+                    date_str TEXT NOT NULL,
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(station, date_str)
+                );
+            """)
+            conn.commit()
+
+    # --- INBOUND (FETCH) METHODS ---
+    def register_fetch(self, station: str, job_type: str, target_str: str, remote_src: str, local_dest: str, force_pending: bool = False):
+        """Registers a remote fetch job. Forces PENDING status if force_pending=True (for growing intraday files)."""
+        with self._get_connection() as conn:
+            if force_pending:
+                conn.execute("""
+                    INSERT INTO inbound_queue (station, job_type, target_str, remote_src, local_dest, status) 
+                    VALUES (?, ?, ?, ?, ?, 'PENDING')
+                    ON CONFLICT(remote_src, target_str) DO UPDATE SET 
+                        status = 'PENDING',
+                        retry_count = 0
+                """, (station, job_type, target_str, remote_src, str(local_dest)))
+            else:
+                conn.execute("""
+                    INSERT INTO inbound_queue (station, job_type, target_str, remote_src, local_dest, status) 
+                    VALUES (?, ?, ?, ?, ?, 'PENDING')
+                    ON CONFLICT(remote_src, target_str) DO UPDATE SET 
+                        status = CASE WHEN inbound_queue.status = 'FETCHED' THEN 'FETCHED' ELSE 'PENDING' END, 
+                        retry_count = CASE WHEN inbound_queue.status = 'FETCHED' THEN inbound_queue.retry_count ELSE 0 END
+                """, (station, job_type, target_str, remote_src, str(local_dest)))
+            conn.commit()
+    
+    def get_pending_fetches(self, job_type: str = None, target_pattern: str = None):
+        """
+        Retrieves pending fetch records from inbound_queue.
+        Optionally filters by job_type ('HOURLY'/'DAILY') and target_pattern (e.g. '2026268').
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+        
+        query = "SELECT id, station, job_type, target_str, remote_src, local_dest FROM inbound_queue WHERE status = 'PENDING'"
+        params = []
+        
+        if job_type:
+            query += " AND job_type = ?"
+            params.append(job_type)
+            
+        if target_pattern:
+            query += " AND target_str LIKE ?"
+            params.append(f"%{target_pattern}%")
+            
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        
+        pending_jobs = []
+        for row in rows:
+            pending_jobs.append({
+                'id': row[0],
+                'station': row[1],
+                'job_type': row[2],
+                'target_str': row[3],
+                'remote_src': row[4],
+                'local_dest': row[5]
+            })
+            
+        conn.close()
+        return pending_jobs
+
+    def mark_inbound(self, job_id: int, success: bool = True):
+        status = 'FETCHED' if success else 'FAILED'
+        with self._get_connection() as conn:
+            if success:
+                conn.execute("UPDATE inbound_queue SET status = ? WHERE id = ?", (status, job_id))
+            else:
+                conn.execute("UPDATE inbound_queue SET status = ?, retry_count = retry_count + 1 WHERE id = ?", (status, job_id))
+            conn.commit()
+
+    def reset_fetch_status(self, target_str: str, job_type: str = None):
+        """Resets matching inbound_queue records to PENDING to allow re-fetching intraday binaries."""
+        with self._get_connection() as conn:
+            if job_type:
+                conn.execute(
+                    "UPDATE inbound_queue SET status = 'PENDING', retry_count = 0 WHERE target_str = ? AND job_type = ?",
+                    (target_str, job_type)
+                )
+            else:
+                conn.execute(
+                    "UPDATE inbound_queue SET status = 'PENDING', retry_count = 0 WHERE target_str = ?",
+                    (target_str,)
+                )
+            conn.commit()
+
+    # --- OUTBOUND (DELIVERY) METHODS ---
+    def register_outbound(self, file_path: str, destination: str):
+        """Registers a newly staged file, explicitly forcing status to PENDING."""
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT INTO outbound_queue (file_path, destination, status, retry_count)
+                VALUES (?, ?, 'PENDING', 0)
+                ON CONFLICT(file_path, destination) DO UPDATE SET
+                    status = 'PENDING',
+                    retry_count = 0,
+                    updated_at = CURRENT_TIMESTAMP;
+            """, (str(file_path), str(destination)))
+            conn.commit()
+
+    def get_pending_outbound(self, target_pattern=None):
+        """Retrieves pending outbound jobs, matching RINEX 3, RINEX 2, and CGGTTS file naming conventions."""
+        with self._get_connection() as conn:
+            if not target_pattern:
+                query = """
+                    SELECT id, file_path, destination, retry_count 
+                    FROM outbound_queue 
+                    WHERE status = 'PENDING' AND retry_count < 10
+                """
+                rows = conn.execute(query).fetchall()
+            else:
+                patterns = [f"%{target_pattern}%"]
+                
+                # Derive format-specific sub-patterns for YYYYDOY inputs (e.g., 2026267)
+                if len(target_pattern) >= 7:
+                    yyyy = target_pattern[:4]
+                    yy = yyyy[2:]
+                    doy = target_pattern[4:7]
+                    
+                    # RINEX 2 pattern (e.g. nist2670.26o)
+                    patterns.append(f"%{doy}0.{yy}%")
+                    
+                    # CGGTTS MJD pattern (e.g. gznisx61.308)
+                    try:
+                        dt = datetime.strptime(f"{yyyy}{doy}", "%Y%j")
+                        mjd = (dt - datetime(1858, 11, 17)).days
+                        mjd_str = str(mjd)
+                        patterns.append(f"%{mjd_str[:2]}.{mjd_str[2:]}%")
+                    except Exception:
+                        pass
+
+                where_clause = " OR ".join(["file_path LIKE ?"] * len(patterns))
+                query = f"""
+                    SELECT id, file_path, destination, retry_count 
+                    FROM outbound_queue 
+                    WHERE status = 'PENDING' AND retry_count < 10 AND ({where_clause})
+                """
+                rows = conn.execute(query, patterns).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_success(self, file_path: str, destination: str):
+        with self._get_connection() as conn:
+            conn.execute("""
+                UPDATE outbound_queue 
+                SET status = 'SUCCESS', updated_at = CURRENT_TIMESTAMP 
+                WHERE file_path = ? AND destination = ?
+            """, (str(file_path), str(destination)))
+            conn.commit()
+
+    def increment_retry(self, file_path: str, destination: str, max_retries: int = 10):
+        with self._get_connection() as conn:
+            conn.execute("""
+                UPDATE outbound_queue 
+                SET retry_count = retry_count + 1,
+                    status = CASE WHEN retry_count + 1 >= ? THEN 'FAILED' ELSE 'PENDING' END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE file_path = ? AND destination = ?
+            """, (max_retries, str(file_path), str(destination)))
+            conn.commit()
+
+    # --- IDEMPOTENCY & QUERY HELPER METHODS ---
+
+    def is_already_processed(self, query_str: str) -> bool:
+        """Checks if a file delivery has successfully completed."""
+        with self._get_connection() as conn:
+            res = conn.execute(
+                "SELECT 1 FROM outbound_queue WHERE file_path LIKE ? AND status = 'SUCCESS' LIMIT 1",
+                (query_str,)
+            ).fetchone()
+            return bool(res)
+
+    def flag_quarantine(self, station: str, date_str: str):
+        with self._get_connection() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO quarantine_log (station, date_str) 
+                VALUES (?, ?)
+            """, (station.lower(), date_str))
+            conn.commit()
+
+    def is_quarantined(self, station: str, date_str: str) -> bool:
+        with self._get_connection() as conn:
+            res = conn.execute(
+                "SELECT 1 FROM quarantine_log WHERE station = ? AND date_str = ?", 
+                (station.lower(), date_str)
+            ).fetchone()
+            return bool(res)
+
+    def get_valid_tags_for_file(self, filename: str, requested_tags: list, destinations_dict: dict = None) -> list:
+        if not requested_tags: 
+            return []
+            
+        valid_tags = []
+        filename_lower = filename.lower()
+        
+        for tag in requested_tags:
+            if "RNX3" in tag.upper() and not (filename_lower.endswith('.rnx.gz') or filename_lower.endswith('.crx.gz')):
+                continue
+            if "RNX2" in tag.upper() and (filename_lower.endswith('.rnx.gz') or filename_lower.endswith('.crx.gz')):
+                continue
+            
+            if destinations_dict and tag in destinations_dict:
+                filters = destinations_dict[tag].get('filters', [])
+                if filters and not any(fnmatch.fnmatch(filename, f) for f in filters):
+                    continue
+                    
+            valid_tags.append(tag)
+            
+        return valid_tags
+
+    def get_status_summary(self):
+        with self._get_connection() as conn:
+            rows = conn.execute("SELECT status, COUNT(*) as count FROM outbound_queue GROUP BY status").fetchall()
+        return [(r['status'], r['count']) for r in rows]
+
+    def reset_failed_jobs(self, target_pattern: str):
+        with self._get_connection() as conn:
+            cursor = conn.execute("""
+                UPDATE outbound_queue
+                SET status = 'PENDING', retry_count = 0, updated_at = CURRENT_TIMESTAMP
+                WHERE status = 'FAILED' AND file_path LIKE ?
+            """, (f"%{target_pattern}%",))
+            conn.commit()
+            return cursor.rowcount
+
+    def reset_status(self, target_pattern: str, destination_tag: str = None) -> int:
+        """
+        Forces a manual backfill by reverting jobs back to PENDING.
+        Resets both outbound delivery and inbound fetch queues for the target pattern.
+        """
+        outbound_query = """
+            UPDATE outbound_queue
+            SET status = 'PENDING', retry_count = 0, updated_at = CURRENT_TIMESTAMP
+            WHERE file_path LIKE ? AND status != 'SUCCESS'
+        """
+        params = [f"%{target_pattern}%"]
+
+        if destination_tag:
+            outbound_query += " AND destination = ?"
+            params.append(destination_tag)
+
+        with self._get_connection() as conn:
+            c1 = conn.execute(outbound_query, params)
+
+            c2 = conn.execute("""
+                UPDATE inbound_queue
+                SET status = 'PENDING', retry_count = 0
+                WHERE remote_src LIKE ? OR target_str LIKE ?
+            """, (f"%{target_pattern}%", f"%{target_pattern}%"))
+
+            conn.commit()
+            return c1.rowcount + c2.rowcount
+
+    def prune_ledger(self, days_to_keep: int) -> int:
+        cutoff_dt = (datetime.now(timezone.utc) - timedelta(days=days_to_keep)).strftime("%Y-%m-%d %H:%M:%S")
+        
+        with self._get_connection() as conn:
+            c1 = conn.execute("""
+                DELETE FROM outbound_queue 
+                WHERE status = 'SUCCESS' AND updated_at < ?
+            """, (cutoff_dt,))
+            
+            c2 = conn.execute("""
+                DELETE FROM inbound_queue 
+                WHERE status = 'FETCHED' AND added_at < ?
+            """, (cutoff_dt,))
+            
+            conn.commit()
+            return c1.rowcount + c2.rowcount
+
+    def cleanup_outbound_buffer(self, buffer_dir: Path) -> int:
+        """Purges files from outbound_buffer once ALL destination jobs for that file are SUCCESS."""
+        buffer_dir = Path(buffer_dir).resolve()
+        if not buffer_dir.exists():
+            return 0
+
+        with self._get_connection() as conn:
+            # Select files where all queue records are SUCCESS and zero are PENDING
+            rows = conn.execute("""
+                SELECT DISTINCT file_path 
+                FROM outbound_queue 
+                WHERE status = 'SUCCESS'
+                  AND file_path NOT IN (
+                      SELECT file_path FROM outbound_queue WHERE status = 'PENDING'
+                  )
+            """).fetchall()
+
+        purged_count = 0
+        for r in rows:
+            file_path = Path(r['file_path'])
+            # Safeguard: only delete files inside the designated outbound_buffer
+            if file_path.exists() and file_path.parent.resolve() == buffer_dir:
+                try:
+                    file_path.unlink()
+                    purged_count += 1
+                    log.info(f"  [CLEANUP] Purged fully delivered buffer artifact: {file_path.name}")
+                except Exception as e:
+                    log.warning(f"  [CLEANUP] Failed to purge {file_path.name}: {e}")
+
+        return purged_count

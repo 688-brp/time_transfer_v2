@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+#
+# db_inspector.sh - State Database Query & Management Utility for GNSS Pipeline
+#
+
+set -euo pipefail
+
+# -----------------------------------------------------------------------------
+# Configuration & Auto-Detection
+# -----------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+# Primary default paths matching project layout
+LIVE_DB="${PROJECT_ROOT}/data_base/pipeline_queue.db"
+SHADOW_DB="${PROJECT_ROOT}/data_base/pipeline_shadow.db"
+
+# Fallbacks if database directory structure varies
+if [[ ! -f "$LIVE_DB" ]]; then
+    LIVE_DB="${PROJECT_ROOT}/var/db/pipeline_queue.db"
+    SHADOW_DB="${PROJECT_ROOT}/var/db/pipeline_shadow.db"
+fi
+
+if [[ ! -f "$LIVE_DB" ]]; then
+    LIVE_DB="${PROJECT_ROOT}/pipeline_queue.db"
+    SHADOW_DB="${PROJECT_ROOT}/pipeline_shadow.db"
+fi
+
+TARGET_DB="$LIVE_DB"
+DB_NAME="LIVE"
+ACTION="summary"
+PATTERN=""
+
+# -----------------------------------------------------------------------------
+# Help Menu
+# -----------------------------------------------------------------------------
+show_help() {
+    cat << EOF
+GNSS State Engine Database Utility
+
+Usage:
+  $(basename "$0") [FLAGS] [ACTIONS]
+
+Target Database Selection:
+  --live                   Query primary cron database (default: $LIVE_DB)
+  --shadow                 Query isolated shadow database ($SHADOW_DB)
+  --db <path>              Specify custom SQLite database path
+
+Action Flags (Default: --summary):
+  -s, --summary            Display total record counts grouped by status
+  -p, --pending            List all currently PENDING inbound/outbound jobs
+  -f, --failed             List all FAILED jobs and retry counts
+  -q, --quarantine         List records in hardware quarantine_log
+  -l, --latest [N]         Show last N modified records (default: 15)
+
+Filter & Mutation Options:
+  --pattern <str>          Filter output by target date/pattern (e.g. '2026270' or '61311')
+  --reset-failed <str>     Revert FAILED jobs matching pattern back to PENDING (retry_count=0)
+  --reset-all <str>        Force re-process ALL jobs (including SUCCESS) for target pattern
+  --mark-success <str>     Mark matching PENDING/FAILED jobs as completed (FETCHED/SUCCESS)
+  --purge-pending [str]    Purge PENDING inbound/outbound records matching pattern (or all if omitted)
+  --purge-failed [str]     Purge FAILED inbound/outbound records matching pattern (or all if omitted)  
+  -h, --help               Show this help menu
+
+Examples:
+  $(basename "$0") --summary
+  $(basename "$0") --pending
+  $(basename "$0") --mark-success 2026270
+  $(basename "$0") --purge-pending 2026270
+  $(basename "$0") --shadow --mark-success 2026270
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# CLI Argument Parser
+# -----------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --live)
+            TARGET_DB="$LIVE_DB"
+            DB_NAME="LIVE"
+            shift
+            ;;
+        --shadow)
+            TARGET_DB="$SHADOW_DB"
+            DB_NAME="SHADOW"
+            shift
+            ;;
+        --db)
+            TARGET_DB="$2"
+            DB_NAME="CUSTOM ($(basename "$2"))"
+            shift 2
+            ;;
+        -s|--summary)
+            ACTION="summary"
+            shift
+            ;;
+	-st|--state)
+            ACTION="state"
+            shift
+            ;;    
+        -p|--pending)
+            ACTION="pending"
+            shift
+            ;;
+        -f|--failed)
+            ACTION="failed"
+            shift
+            ;;
+        -q|--quarantine)
+            ACTION="quarantine"
+            shift
+            ;;
+        -l|--latest)
+            ACTION="latest"
+            LATEST_LIMIT="${2:-15}"
+            if [[ "${LATEST_LIMIT}" =~ ^[0-9]+$ ]]; then shift 2; else LATEST_LIMIT=15; shift; fi
+            ;;
+        --pattern)
+            PATTERN="$2"
+            shift 2
+            ;;
+        --reset-failed)
+            ACTION="reset_failed"
+            PATTERN="$2"
+            shift 2
+            ;;
+        --reset-all)
+            ACTION="reset_all"
+            PATTERN="$2"
+            shift 2
+            ;;
+        --mark-success|--mark-done)
+            ACTION="mark_success"
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                PATTERN="$2"
+                shift 2
+            else
+                shift 1
+            fi
+            ;;
+        --purge-pending)
+            ACTION="purge_pending"
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                PATTERN="$2"
+                shift 2
+            else
+                shift 1
+            fi
+            ;;
+        --purge-failed)
+            ACTION="purge_failed"
+            if [[ $# -gt 1 && ! "$2" =~ ^- ]]; then
+                PATTERN="$2"
+                shift 2
+            else
+                shift 1
+            fi
+            ;;
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        *)
+            echo "[ERROR] Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# -----------------------------------------------------------------------------
+# Database Validation
+# -----------------------------------------------------------------------------
+if ! command -v sqlite3 &> /dev/null; then
+    echo "[ERROR] 'sqlite3' CLI utility is not installed or not in PATH."
+    exit 1
+fi
+
+if [[ ! -f "$TARGET_DB" ]]; then
+    echo "[ERROR] Target database does not exist: $TARGET_DB"
+    exit 1
+fi
+
+sql_exec() {
+    sqlite3 -header -column "$TARGET_DB" "$1"
+}
+
+# -----------------------------------------------------------------------------
+# Action Handlers
+# -----------------------------------------------------------------------------
+echo "======================================================================"
+echo " GNSS STATE ENGINE INSPECTOR [$DB_NAME DB]"
+echo " Database File: $TARGET_DB"
+if [[ -n "$PATTERN" ]]; then
+    echo " Target Filter:  '$PATTERN'"
+fi
+echo "======================================================================"
+
+case "$ACTION" in
+    summary)
+        echo ""
+        echo "--- INBOUND QUEUE (FETCHES) ---"
+        sql_exec "SELECT status, COUNT(*) AS count FROM inbound_queue GROUP BY status;"
+        
+        echo ""
+        echo "--- OUTBOUND QUEUE (DELIVERIES) ---"
+        sql_exec "SELECT status, COUNT(*) AS count FROM outbound_queue GROUP BY status;"
+        
+        echo ""
+        echo "--- HARDWARE QUARANTINE LOG ---"
+        sql_exec "SELECT COUNT(*) AS total_quarantined_events FROM quarantine_log;"
+        ;;
+
+    pending)
+        echo ""
+        echo "--- PENDING INBOUND FETCHES ---"
+        WHERE_IN="WHERE status = 'PENDING'"
+        if [[ -n "$PATTERN" ]]; then WHERE_IN+=" AND target_str LIKE '%${PATTERN}%'"; fi
+        sql_exec "SELECT id, station, job_type, target_str, retry_count FROM inbound_queue ${WHERE_IN} ORDER BY id DESC;"
+
+        echo ""
+        echo "--- PENDING OUTBOUND DELIVERIES ---"
+        WHERE_OUT="WHERE status = 'PENDING'"
+        if [[ -n "$PATTERN" ]]; then WHERE_OUT+=" AND file_path LIKE '%${PATTERN}%'"; fi
+        sql_exec "SELECT id, file_path, destination, retry_count, updated_at FROM outbound_queue ${WHERE_OUT} ORDER BY id DESC;"
+        ;;
+
+    failed)
+        echo ""
+        echo "--- FAILED INBOUND FETCHES ---"
+        WHERE_IN="WHERE status = 'FAILED'"
+        if [[ -n "$PATTERN" ]]; then WHERE_IN+=" AND target_str LIKE '%${PATTERN}%'"; fi
+        sql_exec "SELECT id, station, job_type, target_str, retry_count, remote_src FROM inbound_queue ${WHERE_IN} ORDER BY id DESC;"
+
+        echo ""
+        echo "--- FAILED OUTBOUND DELIVERIES ---"
+        WHERE_OUT="WHERE status = 'FAILED'"
+        if [[ -n "$PATTERN" ]]; then WHERE_OUT+=" AND file_path LIKE '%${PATTERN}%'"; fi
+        sql_exec "SELECT id, file_path, destination, retry_count, updated_at FROM outbound_queue ${WHERE_OUT} ORDER BY id DESC;"
+        ;;
+
+    quarantine)
+        echo ""
+        echo "--- QUARANTINE LOG ENTRIES ---"
+        WHERE_Q=""
+        if [[ -n "$PATTERN" ]]; then WHERE_Q="WHERE date_str LIKE '%${PATTERN}%' OR station LIKE '%${PATTERN}%'"; fi
+        sql_exec "SELECT station, date_str, added_at FROM quarantine_log ${WHERE_Q} ORDER BY added_at DESC;"
+        ;;
+
+    latest)
+        LIMIT="${LATEST_LIMIT:-15}"
+        echo ""
+        echo "--- RECENT OUTBOUND ACTIVITY (LAST ${LIMIT}) ---"
+        sql_exec "SELECT id, file_path, destination, status, retry_count, updated_at FROM outbound_queue ORDER BY updated_at DESC LIMIT ${LIMIT};"
+        ;;
+
+    reset_failed)
+        if [[ -z "$PATTERN" ]]; then
+            echo "[ERROR] --reset-failed requires a target pattern string (e.g. --reset-failed 2026270)."
+            exit 1
+        fi
+        echo ""
+        echo "[ADMIN] Resetting FAILED records to PENDING for pattern: '$PATTERN'..."
+        
+        R1=$(sqlite3 "$TARGET_DB" "UPDATE outbound_queue SET status = 'PENDING', retry_count = 0, updated_at = CURRENT_TIMESTAMP WHERE status = 'FAILED' AND file_path LIKE '%${PATTERN}%'; SELECT changes();")
+        R2=$(sqlite3 "$TARGET_DB" "UPDATE inbound_queue SET status = 'PENDING', retry_count = 0 WHERE status = 'FAILED' AND (target_str LIKE '%${PATTERN}%' OR remote_src LIKE '%${PATTERN}%'); SELECT changes();")
+        
+        echo "[ADMIN] Successfully reset ${R1} outbound queue job(s) and ${R2} inbound fetch job(s)."
+        ;;
+
+    reset_all)
+        if [[ -z "$PATTERN" ]]; then
+            echo "[ERROR] --reset-all requires a target pattern string (e.g. --reset-all 2026270)."
+            exit 1
+        fi
+        echo ""
+        echo "[ADMIN] FORCING FULL RESET (ALL STATUSES -> PENDING) for pattern: '$PATTERN'..."
+        
+        R1=$(sqlite3 "$TARGET_DB" "UPDATE outbound_queue SET status = 'PENDING', retry_count = 0, updated_at = CURRENT_TIMESTAMP WHERE file_path LIKE '%${PATTERN}%'; SELECT changes();")
+        R2=$(sqlite3 "$TARGET_DB" "UPDATE inbound_queue SET status = 'PENDING', retry_count = 0 WHERE target_str LIKE '%${PATTERN}%' OR remote_src LIKE '%${PATTERN}%'); SELECT changes();")
+        
+        echo "[ADMIN] Successfully reset ${R1} outbound queue job(s) and ${R2} inbound fetch job(s)."
+        ;;
+
+    mark_success)
+        if [[ -z "$PATTERN" ]]; then
+            echo "[ERROR] --mark-success requires a target pattern string (e.g. --mark-success 2026270)."
+            exit 1
+        fi
+        echo ""
+        echo "[ADMIN] Marking records as SUCCESS/FETCHED for pattern: '$PATTERN'..."
+
+        R1=$(sqlite3 "$TARGET_DB" "UPDATE inbound_queue SET status = 'FETCHED' WHERE status != 'FETCHED' AND (target_str LIKE '%${PATTERN}%' OR remote_src LIKE '%${PATTERN}%'); SELECT changes();")
+        R2=$(sqlite3 "$TARGET_DB" "UPDATE outbound_queue SET status = 'SUCCESS', updated_at = CURRENT_TIMESTAMP WHERE status != 'SUCCESS' AND file_path LIKE '%${PATTERN}%'; SELECT changes();")
+
+        echo "[ADMIN] Marked ${R1} inbound fetch(es) as FETCHED and ${R2} outbound delivery job(s) as SUCCESS."
+        ;;
+
+    purge_pending)
+        echo ""
+        if [[ -n "$PATTERN" ]]; then
+            echo "[ADMIN] Purging PENDING inbound and outbound records for pattern: '$PATTERN'..."
+            R1=$(sqlite3 "$TARGET_DB" "DELETE FROM inbound_queue WHERE status = 'PENDING' AND (target_str LIKE '%${PATTERN}%' OR remote_src LIKE '%${PATTERN}%'); SELECT changes();")
+            R2=$(sqlite3 "$TARGET_DB" "DELETE FROM outbound_queue WHERE status = 'PENDING' AND file_path LIKE '%${PATTERN}%'; SELECT changes();")
+        else
+            echo "[ADMIN] Purging ALL PENDING inbound and outbound records..."
+            R1=$(sqlite3 "$TARGET_DB" "DELETE FROM inbound_queue WHERE status = 'PENDING'; SELECT changes();")
+            R2=$(sqlite3 "$TARGET_DB" "DELETE FROM outbound_queue WHERE status = 'PENDING'; SELECT changes();")
+        fi
+        echo "[ADMIN] Successfully deleted ${R1} pending inbound fetch(es) and ${R2} pending outbound delivery job(s)."
+        ;;
+    
+    purge_failed)
+        echo ""
+        if [[ -n "$PATTERN" ]]; then
+            echo "[ADMIN] Purging FAILED inbound and outbound records for pattern: '$PATTERN'..."
+            R1=$(sqlite3 "$TARGET_DB" "DELETE FROM inbound_queue WHERE status = 'FAILED' AND (target_str LIKE '%${PATTERN}%' OR remote_src LIKE '%${PATTERN}%'); SELECT changes();")
+            R2=$(sqlite3 "$TARGET_DB" "DELETE FROM outbound_queue WHERE status = 'FAILED' AND file_path LIKE '%${PATTERN}%'; SELECT changes();")
+        else
+            echo "[ADMIN] Purging ALL FAILED inbound and outbound records..."
+            R1=$(sqlite3 "$TARGET_DB" "DELETE FROM inbound_queue WHERE status = 'FAILED'; SELECT changes();")
+            R2=$(sqlite3 "$TARGET_DB" "DELETE FROM outbound_queue WHERE status = 'FAILED'; SELECT changes();")
+        fi
+        echo "[ADMIN] Successfully deleted ${R1} failed inbound fetch(es) and ${R2} failed outbound delivery job(s)."
+        ;;
+    state)
+        echo ""
+        echo "--- DATABASE METRICS ---"
+        DB_SIZE=$(du -h "$TARGET_DB" | cut -f1)
+        echo "DB Disk Usage : $DB_SIZE"
+        sql_exec "PRAGMA journal_mode;"
+        
+        echo ""
+        echo "--- QUEUE SUMMARY ---"
+        echo "[Inbound Fetches]"
+        sql_exec "SELECT status, COUNT(*) AS total FROM inbound_queue GROUP BY status;"
+        echo "[Outbound Deliveries]"
+        sql_exec "SELECT status, COUNT(*) AS total FROM outbound_queue GROUP BY status;"
+
+        echo ""
+        echo "--- OLDEST UNPROCESSED JOBS ---"
+        echo "[Oldest Pending Fetch]"
+        sql_exec "SELECT id, station, job_type, target_str, added_at FROM inbound_queue WHERE status = 'PENDING' ORDER BY id ASC LIMIT 1;"
+        echo "[Oldest Pending Delivery]"
+        sql_exec "SELECT id, file_path, destination, updated_at FROM outbound_queue WHERE status = 'PENDING' ORDER BY id ASC LIMIT 1;"
+
+        echo ""
+        echo "--- AT-RISK JOBS (RETRY COUNT > 0) ---"
+        echo "[Inbound Fetches Warning]"
+        sql_exec "SELECT id, station, target_str, retry_count, status FROM inbound_queue WHERE retry_count > 0 AND status = 'PENDING';"
+        echo "[Outbound Deliveries Warning]"
+        sql_exec "SELECT id, file_path, destination, retry_count, status FROM outbound_queue WHERE retry_count > 0 AND status = 'PENDING';"
+
+        echo ""
+        echo "--- FAILED JOBS REQUIRING ATTENTION ---"
+        sql_exec "SELECT id, file_path, destination, retry_count, updated_at FROM outbound_queue WHERE status = 'FAILED';"
+        ;;	
+esac
+
+echo ""
