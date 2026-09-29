@@ -147,7 +147,7 @@ class CggttsWorker(BaseWorker):
             
         return True
 
-    def _package_and_queue(self, sandbox_dir, out_id, src_id, target_mjd, target_dt, raw_tags, is_crossover, is_daily):
+    def _package_and_queue(self, sandbox_dir, out_id, src_id, target_mjd, target_dt, raw_tags, is_crossover, is_daily, qa_only=False):
         """Filters MJD, renames, quarantines if needed, and queues."""
         files_queued = 0
         
@@ -202,12 +202,13 @@ class CggttsWorker(BaseWorker):
             
             self.log.info(f"  [CGGTTS] Queued {final_dest.name} -> {valid_tags}")
             for tag in valid_tags:
-                self.tracker.register_outbound(str(final_dest), tag)
-            files_queued += 1
-
-        return files_queued
-
-    def process(self, out_id, src_id, params, is_crossover, target_dt, nodes_dict, is_daily=False, force_retry=False):
+                if not qa_only:
+                    self.tracker.register_outbound(str(final_dest), tag)
+                files_queued += 1
+                
+                return files_queued
+                
+    def process(self, out_id, src_id, params, is_crossover, target_dt, nodes_dict, is_daily=False, force_retry=False, qa_only=False):
         """Main Orchestration Loop."""
         mjd_epoch = datetime(1858, 11, 17, tzinfo=timezone.utc)
         if is_daily:

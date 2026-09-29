@@ -23,13 +23,18 @@ def mjd_to_dt(mjd: int) -> datetime:
     return datetime(1858, 11, 17, tzinfo=timezone.utc) + timedelta(days=int(mjd))
 
 def _parse_time_str(time_str: str) -> datetime:
-    """Flexibly parses MJD, ISO Date, or ISO Timestamp strings."""
+    """Flexibly parses MJD, YYYYDOY, YYYYMMDD, YYYYDOYHH, or ISO strings."""
     clean_str = str(time_str).strip().replace("T", " ")
     if clean_str.isdigit():
-        if len(clean_str) <= 5:
+        length = len(clean_str)
+        if length <= 5:
             return mjd_to_dt(int(clean_str))
-        elif len(clean_str) == 8:
+        elif length == 7:
+            return datetime.strptime(clean_str, "%Y%j").replace(tzinfo=timezone.utc)
+        elif length == 8:
             return datetime.strptime(clean_str, "%Y%m%d").replace(tzinfo=timezone.utc)
+        elif length == 9:
+            return datetime.strptime(clean_str, "%Y%j%H").replace(tzinfo=timezone.utc)
             
     try:
         return datetime.strptime(clean_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
@@ -126,11 +131,17 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
                     WHERE status IN ('QUARANTINED', 'FAILED') 
                       AND (file_path LIKE ? OR file_path LIKE ?)
                     """,
-                    (f"%{target_str}%", f"%{short_target_str}%")
+                    (f"%{target_str}%", f"%_{short_target_str}%")
                 )
 
-                # 2. AUTO-RECONCILE: Immediately fast-fail any PENDING jobs whose physical buffer files are missing on disk
-                cursor.execute("SELECT id, file_path FROM outbound_queue WHERE status = 'PENDING'")
+                # 2. AUTO-RECONCILE: Target-scoped fast-fail for PENDING jobs with missing physical files
+                cursor.execute(
+                    """
+                    SELECT id, file_path FROM outbound_queue 
+                    WHERE status = 'PENDING' AND (file_path LIKE ? OR file_path LIKE ?)
+                    """,
+                    (f"%{target_str}%", f"%_{short_target_str}%")
+                )
                 pending_outbound = cursor.fetchall()
                 reconciled_count = 0
 
@@ -180,7 +191,7 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
             if needs_rnx2:
                 node.queue_fetch(tracker, target_dt, "DAILY_BIN")
                 
-            if is_cggtts_daily:
+            if is_cggtts_daily and is_historical_day:
                 next_day_dt = target_dt + timedelta(days=1)
                 node.queue_fetch(tracker, next_day_dt, "DAILY_BIN")
 
@@ -196,8 +207,8 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
             # Drain today's files
             drain_fetch_queue(tracker, job_type=jt, target_pattern=target_str)
 
-            # If doing daily CGGTTS, explicitly drain tomorrow's files for boundary stitching
-            if is_cggtts_daily:
+            # If doing daily CGGTTS for historical day, explicitly drain tomorrow's files for boundary stitching
+            if is_cggtts_daily and is_historical_day:
                 next_day_str = (target_dt + timedelta(days=1)).strftime("%Y%j")
                 drain_fetch_queue(tracker, job_type=jt, target_pattern=next_day_str)
                 
@@ -211,24 +222,30 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
 
     skip_rnx2_flag = getattr(args, 'skip_rnx2', False)
 
-    for node in nodes.values():
-        if is_daily_rinex:
-            rinex_worker.process(node, "DAILY", target_str, target_dt, skip_rnx2=skip_rnx2_flag)
-        if is_hourly_rinex:
-            rinex_worker.process(node, "HOURLY", target_str, target_dt)
+    for s_name, node in nodes.items():
+        try:
+            if is_daily_rinex:
+                rinex_worker.process(node, "DAILY", target_str, target_dt, skip_rnx2=skip_rnx2_flag)
+            if is_hourly_rinex:
+                rinex_worker.process(node, "HOURLY", target_str, target_dt)
+        except Exception as e:
+            log.error(f"  [ENGINE] RinexWorker processing failed for station [{s_name}]: {e}")
 
     if is_any_cggtts:
         for out_id, job_cfg in cggtts_jobs.items():
-            cggtts_worker.process(
-                out_id=out_id,
-                src_id=job_cfg["source"],
-                params=job_cfg["params"],
-                is_crossover=False,
-                target_dt=target_dt,
-                nodes_dict=nodes,
-                is_daily=is_cggtts_daily, 
-                force_retry=is_manual
-            )
+            try:
+                cggtts_worker.process(
+                    out_id=out_id,
+                    src_id=job_cfg["source"],
+                    params=job_cfg["params"],
+                    is_crossover=False,
+                    target_dt=target_dt,
+                    nodes_dict=nodes,
+                    is_daily=is_cggtts_daily, 
+                    force_retry=is_manual
+                )
+            except Exception as e:
+                log.error(f"  [ENGINE] CggttsWorker processing failed for job [{out_id}]: {e}")
 
     # -------------------------------------------------------------------------
     # 3.5 DATA INTEGRITY QA GATE (Controls External Delivery)
@@ -242,25 +259,27 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
         if is_any_rinex and not is_any_cggtts:
             log.info("  [ENGINE] Pure RINEX run detected. Generating on-the-fly CGGTTS for QA validation...")
             for cggtts_id, job_cfg in cggtts_jobs.items():
-                cggtts_worker.process(
-                    out_id=cggtts_id, src_id=job_cfg["source"], params=job_cfg["params"],
-                    is_crossover=False, target_dt=target_dt, nodes_dict=nodes,
-                    is_daily=False, force_retry=True 
-                )
+                try:
+                    cggtts_worker.process(
+                        out_id=cggtts_id, src_id=job_cfg["source"], params=job_cfg["params"],
+                        is_crossover=False, target_dt=target_dt, nodes_dict=nodes,
+                        is_daily=False, force_retry=True, qa_only=True
+                    )
+                except Exception as e:
+                    log.error(f"  [ENGINE] QA on-the-fly CGGTTS generation failed for [{cggtts_id}]: {e}")
         
         for cggtts_id, job_cfg in cggtts_jobs.items():
             try:
-                # ADDED: timeout=120 to prevent pipeline from hanging indefinitely 
                 result = subprocess.run(
                     [sys.executable, str(gate_script), str(OUTBOUND_BUFFER), cggtts_id],
-                    capture_output=True, text=True, check=True, timeout=120
+                    capture_output=True, text=True, check=False, timeout=120
                 )
 
                 src_node = job_cfg["source"]
 
-                if "[FAIL]" in result.stdout:
+                if "[FAIL]" in result.stdout or result.returncode != 0:
                     fail_lines = [line.strip() for line in result.stdout.splitlines() if "[FAIL]" in line]
-                    fail_msg = " | ".join(fail_lines) if fail_lines else result.stdout.strip()
+                    fail_msg = " | ".join(fail_lines) if fail_lines else (result.stdout.strip() or result.stderr.strip() or f"Exit Code {result.returncode}")
 
                     log.error(f"  [GATE] Integrity FAILED for {cggtts_id.upper()} (Source: {src_node.upper()}): {fail_msg}")
                     tracker.flag_quarantine(src_node, target_str)
@@ -293,9 +312,9 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
 
             except subprocess.TimeoutExpired:
                 log.error(f"  [GATE] QA Script TIMEOUT for {cggtts_id.upper()} after 120s.")
-            except subprocess.CalledProcessError as e:
-                log.error(f"  [GATE] QA Script crashed for {cggtts_id.upper()}: {e.stderr or e.stdout}")
-    
+            except Exception as e:
+                log.error(f"  [GATE] QA Script execution error for {cggtts_id.upper()}: {e}")
+
     # -------------------------------------------------------------------------
     # 4. DISTRIBUTOR / DELIVERY PHASE
     # -------------------------------------------------------------------------
@@ -303,18 +322,21 @@ def execute_pass(args, target_dt, tracker, log, pipeline_config):
 
     allowed_destinations = set()
 
-    if is_any_cggtts:
-        cggtts_cfg = getattr(pipeline_config, 'CGGTTS_JOBS', {})
-        for job_id, cfg in cggtts_cfg.items():
-            allowed_destinations.update(cfg.get('destinations', []))
+    stations_cfg = getattr(pipeline_config, 'STATIONS', {})
+    for st_id, st_info in stations_cfg.items():
+        if is_hourly_rinex or is_cggtts_rapid:
+            allowed_destinations.update(st_info.get('hourly_dest', []))
+        if is_daily_rinex or is_cggtts_daily:
+            allowed_destinations.update(st_info.get('daily_dest', []))
 
-    if is_any_rinex:
-        rinex_cfg = getattr(pipeline_config, 'RINEX_JOBS', getattr(pipeline_config, 'TARGETS', {}))
-        for job_id, cfg in rinex_cfg.items():
-            allowed_destinations.update(cfg.get('destinations', []))
+    if not allowed_destinations:
+        allowed_destinations = set(destinations.keys())
+
+    is_global_sweep = bool(getattr(args, 'sweep', False))
+    dist_pattern = None if is_global_sweep else target_str
 
     distributor.process_outbound_queue(
-        target_pattern=None if is_manual else target_str,
+        target_pattern=dist_pattern,
         allowed_destinations=allowed_destinations
     )
 

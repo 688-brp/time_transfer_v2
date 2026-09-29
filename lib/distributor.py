@@ -48,7 +48,7 @@ class Distributor:
                 # 3. Buffer Check
                 if not local_path.exists():
                     self.log.error(f"  [DISTRIBUTOR] Missing buffer file: {local_path.name}")
-                    self.tracker.increment_retry(str(local_path), dest_tag)
+                    self.tracker.mark_failed(str(local_path), dest_tag) if hasattr(self.tracker, 'mark_failed') else self.tracker.increment_retry(str(local_path), dest_tag)
                     continue
 
                 # 4. Destination Check
